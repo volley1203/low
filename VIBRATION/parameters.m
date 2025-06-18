@@ -28,4 +28,12 @@ function p = parameters()
     p.zeta_kx = [0.02; 0.01; 0.005];%
     p.zeta_ky = [0.03; 0.02; 0.01];
     p.T_tension_val = p.m * p.g;
+    %PID
+    p.kp_x = 15;
+    p.ki_x = 0;
+    p.kd_x = 5;
+    p.kp_y = 15;
+    p.ki_y = 0;
+    p.kd_y = 5;
+
 end
