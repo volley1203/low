@@ -1,0 +1,459 @@
+clear;clc;close all
+
+%% 初始参数
+p = parameters();
+
+%% 初始条件
+N_states_total = 10 + 2 + 4;
+initial_state = zeros(N_states_total,1);
+
+initial_state(1) = 0.5;
+initial_state(3) = 0.5;
+initial_state(5) = p.l0; % 设置初始绳长
+
+%% 仿真参数
+t_start = 0;
+t_end = 15;
+tspan = [t_start t_end];
+
+%% 由于电机输入
+%desired_acceleration_profile = @(t) design_acceleration_profile(t);
+% control_input_profile = @(t) design_velocity_profile(t);
+
+%% 使用ode45求解器进行仿真
+tic;
+
+% 设置ode45选项，包括事件检测
+options = odeset('Events', @(t,y) limitEvents(t,y,p), 'RelTol', 1e-6, 'AbsTol', 1e-8);
+
+% 初始化仿真状态
+current_time = t_start;
+current_state = initial_state;
+all_time = [];
+all_states = [];
+
+while current_time < t_end
+    % 计算剩余仿真时间
+    remaining_time = t_end - current_time;
+    current_tspan = [current_time, current_time + remaining_time];
+    
+    % 运行ode45直到下一个事件或仿真结束
+    % [t, y, te, ye, ie] = ode45(@(t,y) nonlinear_dynamics_with_limits(t, y, p, control_input_profile), ...
+    %                            current_tspan, current_state, options);
+    [t, y, te, ye, ie] = ode15s(@(t,y) full_controller_dynamics(t, y, p), ... %
+                           current_tspan, current_state, options);
+    
+    % 保存结果
+    all_time = [all_time; t];
+    all_states = [all_states; y];
+    
+    % 检查是否发生了限位事件
+   if ~isempty(te)
+        fprintf('在时间 t=%.3f 发生限位事件，事件ID: %d\n', te(end), ie(end));
+        
+        current_state = ye(end, :)';
+        current_time = te(end);
+        
+        % 硬限位处理：将相应方向的速度设为0
+        event_idx = ie(end);
+        switch event_idx
+            case {1, 2} % X 轴限位
+                current_state(2) = 0;
+                fprintf('  -> X轴达到限位，X方向速度重置为0\n');
+            case {3, 4} % Y 轴限位
+                current_state(4) = 0;
+                fprintf('  -> Y轴达到限位，Y方向速度重置为0\n');
+            case {5, 6} % 绳长限位
+                current_state(6) = 0;
+                fprintf('  -> 绳长达到限位，绳长变化速度重置为0\n');
+        end
+        
+        % 继续仿真
+        current_time = current_time + 1e-6; % 微小时间步进避免重复触发
+    else
+        % 正常结束
+        break;
+    end
+end
+fprintf('仿真完成，用时 %.2f 秒\n', toc);
+
+%% 计算张力和其他输出
+fprintf('计算张力和控制输出...\n');
+global controller_outputs_log; % 访问我们记录下的真实数据
+
+if isempty(controller_outputs_log)
+    error('控制器日志为空，无法进行后处理。');
+end
+
+num_steps = length(all_time);
+outputs.tension = zeros(num_steps, 1);
+
+% --- 新增：数据去重，解决interp1错误 ---
+% 使用 'stable' 选项保留第一次出现的值，顺序不变
+[~, unique_indices] = unique(controller_outputs_log(:,1), 'stable');
+unique_log_data_full = controller_outputs_log(unique_indices, :);
+
+% --- 从去重后的干净数据中提取时间和数据 ---
+log_time = unique_log_data_full(:,1);
+log_data = unique_log_data_full(:,2:end);
+
+% 使用去重后的数据进行插值，现在不会报错了
+interp_data = interp1(log_time, log_data, all_time, 'linear', 'extrap');
+
+% 解析插值后的数据
+outputs.control_inputs = interp_data(:, 1:6);
+outputs.actual_acc     = interp_data(:, 7:9);
+outputs.v_des          = interp_data(:, 10:11);
+outputs.v_gen          = interp_data(:, 12:13);
+
+% 重新计算张力
+for i = 1:num_steps
+    t_i = all_time(i); % 
+    
+    state_i = all_states(i, 1:10)'; 
+    ddq_i   = outputs.actual_acc(i,1:3)';
+    u_i     = outputs.control_inputs(i,:)';
+    
+    f_mx_i = u_i(4); f_my_i = u_i(5); f_mz_i = u_i(6);
+    
+    % 现在调用tension函数时，t_i 是已定义的
+    outputs.tension(i) = tension(t_i, state_i, p, ddq_i(1), ddq_i(2), ddq_i(3), f_mx_i, f_my_i, f_mz_i);
+end
+
+fprintf('张力计算完成，范围: [%.2f, %.2f] N\n', min(outputs.tension), max(outputs.tension));
+
+%% 三维可视化
+animatecart(all_time, all_states(:,1), all_states(:,3), all_states(:,5), ...
+           all_states(:,7), all_states(:,9), p);
+
+%% 绘图
+fprintf('生成结果图表...\n');
+
+% 图1: 系统状态
+figure('Name','系统动态响应','Position',[100 100 1200 800]);
+newcolor=colororder;
+subplot(2,3,1);
+plot(all_time, all_states(:,1), '-', 'Color', newcolor(1,:),'LineWidth', 1.5); hold on;
+plot(all_time, all_states(:,3), '--', 'Color', newcolor(2,:),'LineWidth', 1.5);
+yline(p.x_min, 'b--', '$X_{min}$','Interpreter','latex'); yline(p.x_max, 'b--', '$X_{max}$','Interpreter','latex');
+yline(p.y_min, 'r--', '$Y_{min}$','Interpreter','latex'); yline(p.y_max, 'r--', '$Y_{max}$','Interpreter','latex');
+title('Trolly location','Interpreter','latex'); xlabel('Time (s)','Interpreter','latex'); ylabel('Location (m)','Interpreter','latex');
+legend('$X position$', '$Y position$', 'Location', 'best','Interpreter','latex'); grid on;
+
+subplot(2,3,2);
+plot(all_time, all_states(:,2), '-', 'Color', newcolor(3,:),'LineWidth', 1.5); hold on;
+plot(all_time, all_states(:,4), '-','Color', newcolor(4,:), 'LineWidth', 1.5);
+title('Trolly speed','Interpreter','latex'); xlabel('Time (s)','Interpreter','latex'); ylabel('Speed (m/s)','Interpreter','latex');
+legend('X speed', 'Y speed', 'Location', 'best','Interpreter','latex'); grid on;
+
+subplot(2,3,3);
+plot(all_time, all_states(:,5), '-', 'Color', newcolor(5,:),'LineWidth', 1.5);
+yline(p.l_min, 'r--', '$L_{min}$','Interpreter','latex'); yline(p.l_max, 'r--', '$L_{max}$','Interpreter','latex');
+title('Sling length','Interpreter','latex'); xlabel('Time (s)','Interpreter','latex'); ylabel('Length (m)','Interpreter','latex');
+legend('Sling length', 'Location', 'best','Interpreter','latex'); grid on;
+
+subplot(2,3,4);
+plot(all_time, all_states(:,7)*180/pi, '-', 'Color', [162, 20, 47]/255, 'LineWidth', 1.5); hold on;
+plot(all_time, all_states(:,9)*180/pi, '--', 'Color', [217, 83, 25]/255, 'LineWidth', 1.5);
+title('Swing angle','Interpreter','latex'); xlabel('Time (s)','Interpreter','latex'); ylabel('Angle (°)','Interpreter','latex');
+legend('$\theta_x$', '$\theta_y$', 'Location', 'best','Interpreter','latex'); grid on;
+
+subplot(2,3,5);
+plot(all_time, all_states(:,8)*180/pi, '-', 'Color', [0, 191, 255]/255,'LineWidth', 1.5); hold on;
+plot(all_time, all_states(:,10)*180/pi, '--','Color', [210, 105, 30]/255, 'LineWidth', 1.5);
+title('Angular velocity','Interpreter','latex'); xlabel('Time (s)','Interpreter','latex'); ylabel('Angular velocity (°/second)','Interpreter','latex');
+legend('$\omega_x$', '$\omega_y$', 'Location', 'best','Interpreter','latex'); grid on;
+
+subplot(2,3,6);
+plot(all_time, outputs.tension, '-', 'Color', [255, 69, 0]/255,'LineWidth', 1.5);
+title('Sling tension','Interpreter','latex'); xlabel('Time (s)','Interpreter','latex'); ylabel('Tension (N)','Interpreter','latex');
+grid on;
+
+% 图2: 控制输入
+figure('Name','控制输入','Position',[150 150 800 600]);
+newcolor=colororder;
+subplot(2,1,1);
+plot(all_time, outputs.control_inputs(:,1), '-','Color', newcolor(1,:), 'LineWidth', 1.5); hold on;
+plot(all_time, outputs.control_inputs(:,2), '-','Color', newcolor(2,:), 'LineWidth', 1.5);
+plot(all_time, outputs.control_inputs(:,3), '-','Color', newcolor(3,:), 'LineWidth', 1.5);
+title('Platform acceleration command','Interpreter','latex'); xlabel('Time (s)','Interpreter','latex'); ylabel('Acceleration (m/s²)','Interpreter','latex');
+legend('$a_x$', '$a_y$', '$a_l$', 'Location', 'best','Interpreter','latex'); grid on;
+
+subplot(2,1,2);
+% plot(all_time, outputs.control_inputs(:,4), '-','Color', newcolor(4,:), 'LineWidth', 1.5); hold on;
+% plot(all_time, outputs.control_inputs(:,5), '-','Color', newcolor(5,:), 'LineWidth', 1.5);
+% plot(all_time, outputs.control_inputs(:,6), '-','Color', newcolor(6,:), 'LineWidth', 1.5);
+% title('Mobile robot force input','Interpreter','latex'); xlabel('Time (s)','Interpreter','latex'); ylabel('Force (N)','Interpreter','latex');
+% legend('$f_{mx}$', '$f_{my}$', '$f_{mz}$', 'Location', 'best','Interpreter','latex'); grid on;
+plot(all_time, outputs.actual_acc(:,1), '-','Color', newcolor(1,:), 'LineWidth', 1.5); hold on;
+plot(all_time, outputs.actual_acc(:,2), '-','Color', newcolor(2,:), 'LineWidth', 1.5);
+plot(all_time, outputs.actual_acc(:,3), '-','Color', newcolor(3,:), 'LineWidth', 1.5);
+title('Platform actual acceleration','Interpreter','latex'); xlabel('Time (s)','Interpreter','latex'); ylabel('Acceleration (m/s²)','Interpreter','latex');
+legend('$a_x$', '$a_y$', '$a_l$', 'Location', 'best','Interpreter','latex'); grid on;
+
+figure('Name','力和实际加速度','Position',[150 150 800 600]);
+newcolor=colororder;
+plot(all_time, outputs.control_inputs(:,4), '-','Color', newcolor(4,:), 'LineWidth', 1.5); hold on;
+plot(all_time, outputs.control_inputs(:,5), '--','Color', newcolor(5,:), 'LineWidth', 1.5);
+plot(all_time, outputs.control_inputs(:,6), ':','Color', newcolor(6,:), 'LineWidth', 1.5);
+title('Mobile robot force input','Interpreter','latex'); xlabel('Time (s)','Interpreter','latex'); ylabel('Force (N)','Interpreter','latex');
+legend('$f_{mx}$', '$f_{my}$', '$f_{mz}$', 'Location', 'best','Interpreter','latex'); grid on;
+% subplot(2,1,2);
+% plot(all_time, outputs.control_inputs(:,4), 'b-', 'LineWidth', 1.5); hold on;
+% plot(all_time, outputs.control_inputs(:,5), 'r-', 'LineWidth', 1.5);
+% plot(all_time, outputs.control_inputs(:,6), 'g-', 'LineWidth', 1.5);
+% title('主动施加于负载的力'); xlabel('时间 (s)'); ylabel('力 (N)');
+% legend('f_{mx}', 'f_{my}', 'f_{mz}', 'Location', 'best'); grid on;
+
+% 提取核心数据用于绘图，使代码更清晰
+time = all_time;
+trolley_pos_x = all_states(:, 1);
+trolley_vel_x = all_states(:, 2);
+trolley_pos_y = all_states(:, 3);
+trolley_vel_y = all_states(:, 4);
+theta_x_deg   = all_states(:, 7) * 180/pi;
+theta_y_deg   = all_states(:, 9) * 180/pi;
+
+% 从outputs结构体中提取控制器内部变量
+a_cmd_x = outputs.control_inputs(:, 1);
+a_cmd_y = outputs.control_inputs(:, 2);
+v_des_x = outputs.v_des(:, 1);
+v_des_y = outputs.v_des(:, 2);
+v_gen_x = outputs.v_gen(:, 1);
+v_gen_y = outputs.v_gen(:, 2);
+
+% 设置颜色
+newcolor = colororder;
+
+%% 图 1: 核心目标 - 摆角响应
+figure('Name', 'PID Tuning - 1: Swing Angle Response (Primary Goal)', 'Position', [100, 100, 800, 600]);
+plot(time, theta_x_deg, '-', 'Color', newcolor(1,:), 'LineWidth', 2); hold on;
+plot(time, theta_y_deg, '--', 'Color', newcolor(2,:), 'LineWidth', 2);
+yline(0, 'k:', 'LineWidth', 1); % 目标线
+title('Swing Angle Response $\theta(t)$', 'Interpreter', 'latex');
+xlabel('Time (s)', 'Interpreter', 'latex');
+ylabel('Angle ($^{\circ}$)', 'Interpreter', 'latex');
+legend('$\theta_x$', '$\theta_y$', 'Location', 'best', 'Interpreter', 'latex');
+grid on;
+% sgtitle({'**调试目标**: 让摆角快速、平稳地收敛到0。', '观察超调量、收敛时间和振荡情况'}, 'FontWeight', 'normal','Interpreter', 'latex');
+
+%% 图 2: 控制行为 - 小车运动
+figure('Name', 'PID Tuning - 2: Trolley Motion (Control Action)', 'Position', [150, 150, 800, 600]);
+subplot(1, 2, 1);
+plot(time, trolley_pos_x, '-', 'Color', newcolor(4,:), 'LineWidth', 1.5); hold on;
+plot(time, trolley_pos_y, '--', 'Color', newcolor(5,:), 'LineWidth', 1.5);
+title('Trolley Position', 'Interpreter', 'latex');
+xlabel('Time (s)', 'Interpreter', 'latex');
+ylabel('Position (m)', 'Interpreter', 'latex');
+legend('$x(t)$', '$y(t)$', 'Location', 'best', 'Interpreter', 'latex');
+grid on;
+
+subplot(1, 2, 2);
+plot(time, trolley_vel_x, '-', 'Color', newcolor(3,:), 'LineWidth', 1.5); hold on;
+plot(time, trolley_vel_y, '--', 'Color', newcolor(6,:), 'LineWidth', 1.5);
+title('Trolley Velocity', 'Interpreter', 'latex');
+xlabel('Time (s)', 'Interpreter', 'latex');
+ylabel('Velocity (m/s)', 'Interpreter', 'latex');
+legend('$\dot{x}(t)$', '$\dot{y}(t)$', 'Location', 'best', 'Interpreter', 'latex');
+grid on;
+% sgtitle({'**调试目标**: 小车运动平滑，响应迅速。', '观察运动范围和速度大小是否合理'}, 'FontWeight', 'normal','Interpreter', 'latex');
+
+%% 图 3: 控制器内部状态 (诊断视图)
+figure('Name', 'PID Tuning - 3: Controller Internals (Diagnosis)', 'Position', [100, 100, 800, 600]);
+
+% 子图1: PID的原始输出 (期望速度)
+subplot(3, 1, 1);
+plot(time, v_des_x, '-', 'Color', newcolor(1,:), 'LineWidth', 1.5); hold on;
+plot(time, v_des_y, '--', 'Color', newcolor(2,:), 'LineWidth', 1.5);
+title('PID Desired Velocity Output', 'Interpreter', 'latex');
+xlabel('Time (s)', 'Interpreter', 'latex');
+ylabel('Velocity (m/s)', 'Interpreter', 'latex');
+legend('$v_{des,x}$', '$v_{des,y}$', 'Location', 'best', 'Interpreter', 'latex');
+grid on;
+
+% 子图2: S曲线平滑后的速度
+subplot(3, 1, 2);
+plot(time, v_gen_x, '-', 'Color', newcolor(1,:), 'LineWidth', 1.5); hold on;
+plot(time, v_gen_y, '--', 'Color', newcolor(2,:), 'LineWidth', 1.5);
+title('S-Curve Smoothed Velocity', 'Interpreter', 'latex');
+xlabel('Time (s)', 'Interpreter', 'latex');
+ylabel('Velocity (m/s)', 'Interpreter', 'latex');
+legend('$v_{gen,x}$', '$v_{gen,y}$', 'Location', 'best', 'Interpreter', 'latex');
+grid on;
+
+% 子图3: 最终的加速度指令
+subplot(3, 1, 3);
+plot(time, a_cmd_x, '-', 'Color', newcolor(1,:), 'LineWidth', 1.5); hold on;
+plot(time, a_cmd_y, '--', 'Color', newcolor(2,:), 'LineWidth', 1.5);
+title('Final Commanded Acceleration', 'Interpreter', 'latex');
+xlabel('Time (s)', 'Interpreter', 'latex');
+ylabel('Acceleration (m/s$^2$)', 'Interpreter', 'latex');
+legend('$a_{cmd,x}$', '$a_{cmd,y}$', 'Location', 'best', 'Interpreter', 'latex');
+grid on;
+% sgtitle({'**调试目标**: 理解控制器内部行为。', '观察$v_{des}$是否震荡, $v_{gen}$是否平滑, $a_{cmd}$是否合理'}, 'FontWeight', 'normal','Interpreter', 'latex');
+
+fprintf('仿真和绘图完成！\n');
+%% 小车控制输入
+
+% function u = design_velocity_profile(t)
+%     % u = [v_des_x; v_des_y; v_des_l; f_mx; f_my; f_mz]
+% 
+%     % X方向: 目标速度0.2 m/s, 加速时间1s
+%     v_des_x = trapezoidal_vel(t, 1.0, 5.0, 1.0, 0.2);
+%     % Y方向: 目标速度0.15 m/s, 加速时间0.8s
+%     v_des_y = trapezoidal_vel(t, 1.0, 5.0, 0.8, 0.15);
+%     % Z方向(绳长): 目标速度-0.1 m/s (收绳), 加速时间1s
+%     v_des_l = trapezoidal_vel(t, 7.0, 11.0, 1.0, -0.1);
+% 
+%     % 施加于负载的主动力/扰动力 (这部分不变)
+%     f_mx = 0; f_my = 0; f_mz = 0;
+%     if t >= 8.0 && t < 10.0
+%         f_mx = 5.0;
+%     end
+%     if t >= 11.0 && t < 12.0
+%         f_my = -4.0;
+%     end
+% 
+%     u = [v_des_x; v_des_y; v_des_l; f_mx; f_my; f_mz];
+% end
+% 
+% % 辅助函数：生成梯形速度曲线
+% function v = trapezoidal_vel(t, t_start, t_end, t_accel, v_max)
+%     t_decel = t_accel;
+%     if t < t_start || t > t_end
+%         v = 0;
+%     elseif t < (t_start + t_accel) % 加速段
+%         v = v_max * (t - t_start) / t_accel;
+%     elseif t < (t_end - t_decel) % 匀速段
+%         v = v_max;
+%     else % 减速段
+%         v = v_max * (t_end - t) / t_decel;
+%     end
+% end
+% 
+% function dydt = nonlinear_dynamics_with_limits(t, y, p, control_profile)
+%     % 带限位检查的动力学函数
+% 
+%     % 获取期望控制输入
+%     control_inputs = control_profile(t);
+% 
+%     % 检查是否在边界处，如果是则修改加速度指令
+%      x = y(1); y_pos = y(3); l = y(5);
+% 
+%     if (x <= p.x_min && control_inputs(1) < 0) || (x >= p.x_max && control_inputs(1) > 0)
+%         control_inputs(1) = 0;
+%     end
+%     if (y_pos <= p.y_min && control_inputs(2) < 0) || (y_pos >= p.y_max && control_inputs(2) > 0)
+%         control_inputs(2) = 0;
+%     end
+%     if (l <= p.l_min && control_inputs(3) < 0) || (l >= p.l_max && control_inputs(3) > 0)
+%         control_inputs(3) = 0;
+%     end
+% 
+%     dydt = nonlinear_dynamics(t, y, p, control_inputs);
+% end
+function dydt = full_controller_dynamics(t, y, p)
+    % 使用persistent和global变量来记录数据
+    persistent last_log_time;
+    if isempty(last_log_time)
+        last_log_time = -inf;
+    end
+    global controller_outputs_log;
+
+    %% 解包状态向量 
+    state_orig = y(1:10);
+    x_pos = state_orig(1); dx = state_orig(2); 
+    y_pos = state_orig(3); dy = state_orig(4);
+    l_pos = state_orig(5);
+    theta_x = state_orig(7); dtheta_x = state_orig(8);
+    theta_y = state_orig(9); dtheta_y = state_orig(10);
+    
+    integral_error_x = y(11); integral_error_y = y(12);
+    
+    v_gen_x = y(13); a_gen_x = y(14);
+    v_gen_y = y(15); a_gen_y = y(16);
+
+    % %% PID控制器 
+    % error_x = theta_x; 
+    % error_y = theta_y;
+    % 
+    % v_des_x = p.Kp_x * error_x + p.Ki_x * integral_error_x + p.Kd_x * dtheta_x;
+    % v_des_y = p.Kp_y * error_y + p.Ki_y * integral_error_y + p.Kd_y * dtheta_y;
+
+    sensor_disp_x = p.l_sensor * sin(theta_x);
+    sensor_disp_y = p.l_sensor * sin(theta_y);
+    
+    % PID的目标现在是让这个位移归零
+    error_x = sensor_disp_x; 
+    error_y = sensor_disp_y;
+    
+    % 对误差求导: d(error_x)/dt = d(l_s*sin(theta_x))/dt = l_s*cos(theta_x)*dtheta_x
+    derivative_error_x = p.l_sensor * cos(theta_x) * dtheta_x;
+    derivative_error_y = p.l_sensor * cos(theta_y) * dtheta_y;
+    
+    % 使用新的误差和误差导数来计算期望速度
+    v_des_x = p.Kp_x * error_x + p.Ki_x * integral_error_x + p.Kd_x * derivative_error_x;
+    v_des_y = p.Kp_y * error_y + p.Ki_y * integral_error_y + p.Kd_y * derivative_error_y;
+
+    %% 速度指令限位检查
+    if (x_pos <= p.x_min && v_des_x < 0) || (x_pos >= p.x_max && v_des_x > 0)
+        v_des_x = 0;
+    end
+    if (y_pos <= p.y_min && v_des_y < 0) || (y_pos >= p.y_max && v_des_y > 0)
+        v_des_y = 0;
+    end
+    
+    %% 内环: S曲线轨迹生成器 (计算平滑的执行指令 a_cmd)
+    a_target_x = p.Kv_track * (v_des_x - v_gen_x);
+    jerk_x = p.Ka_track * (a_target_x - a_gen_x);
+    jerk_x = max(-p.J_max, min(p.J_max, jerk_x));
+    
+    a_target_y = p.Kv_track * (v_des_y - v_gen_y);
+    jerk_y = p.Ka_track * (a_target_y - a_gen_y);
+    jerk_y = max(-p.J_max, min(p.J_max, jerk_y));
+    
+    a_cmd_x = a_gen_x;
+    a_cmd_y = a_gen_y;
+
+    %% 定义外部激励力
+    force_magnitude = 5.0; 
+    f_mx = 0; f_my = 0; f_mz = 0;
+    if t >= 1.0 && t < 7.5
+        f_mx = force_magnitude;
+        f_my = force_magnitude;
+    end
+
+    %% 底层动力学 
+    % % 
+    v_des_fake_x = a_cmd_x * p.tau_x + dx;
+    v_des_fake_y = a_cmd_y * p.tau_y + dy;
+
+    % 
+    u_for_dynamics = [v_des_fake_x; v_des_fake_y; 0; f_mx; f_my; f_mz];
+
+    dydt_orig = nonlinear_dynamics(t, state_orig, p, u_for_dynamics);
+
+    % u_for_dynamics = [a_cmd_x; a_cmd_y; 0; f_mx; f_my; f_mz];
+    % 
+    % % 
+    % dydt_orig = nonlinear_dynamics(t, state_orig, p, u_for_dynamics);
+    %%  组合所有状态的导数
+    dydt = zeros(16, 1);
+    dydt(1:10) = dydt_orig;
+    dydt(11) = error_x;       % d(integral_error_x)/dt
+    dydt(12) = error_y;       % d(integral_error_y)/dt
+    dydt(13) = a_gen_x;       % dv_gen_x / dt
+    dydt(14) = jerk_x;        % da_gen_x / dt
+    dydt(15) = a_gen_y;       % dv_gen_y / dt
+    dydt(16) = jerk_y;        % da_gen_y / dt
+
+    %% 记录用于绘图的真实数据
+    if t > last_log_time + 0.01 
+        actual_acc = dydt_orig([2, 4, 6]);
+        % 记录的control_inputs是我们的真实意图（加速度指令+力）
+        logged_control_inputs = [a_cmd_x; a_cmd_y; 0; f_mx; f_my; f_mz];
+        log_entry = [t, logged_control_inputs', actual_acc', v_des_x, v_des_y, v_gen_x, v_gen_y];
+        controller_outputs_log = [controller_outputs_log; log_entry];
+        last_log_time = t;
+    end
+end
